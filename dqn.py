@@ -30,6 +30,47 @@ def init_weights(m):
             nn.init.constant_(m.bias, 0)
 
 
+class DuelingDQN(nn.Module):
+    def __init__(self, num_actions):
+        super(DuelingDQN, self).__init__()
+        self.num_actions = num_actions
+
+        # 共享的卷積層
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(4, 32, kernel_size=8, stride=4), nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2), nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1), nn.ReLU(),
+            nn.Flatten()
+        )
+        conv_output_size = 64 * 7 * 7 # 3136
+
+        # Value Stream
+        self.value_stream = nn.Sequential(
+            nn.Linear(conv_output_size, 512), nn.ReLU(),
+            nn.Linear(512, 1) # 輸出 V(s)
+        )
+
+        # Advantage Stream
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(conv_output_size, 512), nn.ReLU(),
+            nn.Linear(512, num_actions) # 輸出 A(s, a)
+        )
+
+    def forward(self, x):
+        # 首先通過共享的卷積層
+        features = self.conv_layers(x / 255.0) # 歸一化
+
+        # 分別計算 V(s) 和 A(s, a)
+        values = self.value_stream(features)
+        advantages = self.advantage_stream(features)
+
+        # 組合 V 和 A -> Q
+        # Q(s, a) = V(s) + (A(s, a) - mean(A(s, a')))
+        q_values = values + (advantages - advantages.mean(1, keepdim=True))
+
+        return q_values
+
+
 class DQN(nn.Module):
     def __init__(self, env, num_actions):
         super(DQN, self).__init__()
@@ -289,6 +330,7 @@ class DQNAgent:
         self.preprocessor = AtariPreprocessor()
         self.dry = args.dry if hasattr(args, 'dry') else False
         self.use_ddqn = args.use_ddqn if hasattr(args, 'use_ddqn') else False
+        self.use_dueling = args.use_dueling if hasattr(args, 'use_dueling') else False
         
         # 時間追蹤相關變數
         self.last_time = time.time()
@@ -303,8 +345,13 @@ class DQNAgent:
             
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print("Using device:", self.device)
-        self.q_net = DQN(env_name, self.num_actions).to(self.device)
-        self.target_net = DQN(env_name, self.num_actions).to(self.device)
+        # 根據是否使用 DuelingDQN 選擇網路架構
+        if self.use_dueling and self.env_name == "ALE/Pong-v5":
+            self.q_net = DuelingDQN(self.num_actions).to(self.device)
+            self.target_net = DuelingDQN(self.num_actions).to(self.device)
+        else:
+            self.q_net = DQN(env_name, self.num_actions).to(self.device)
+            self.target_net = DQN(env_name, self.num_actions).to(self.device)
 
         self.q_net.apply(init_weights)
         self.target_net.load_state_dict(self.q_net.state_dict())
@@ -376,7 +423,8 @@ class DQNAgent:
             'max_episode_steps': args.max_episode_steps,
             'train_per_step': args.train_per_step,
             'use_prioritized_replay': args.use_prioritized_replay,
-            'eval_episodes': args.eval_episodes
+            'eval_episodes': args.eval_episodes,
+            'use_dueling': args.use_dueling
         }
         
         # 建立超參數檔案的路徑
@@ -663,6 +711,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval-episodes", type=int, default=5, help="Number of episodes to evaluate")
     parser.add_argument("--checkpoint-path", type=str, help="Path to checkpoint file")
     parser.add_argument("--use-ddqn", action="store_true", help="Whether to use Double DQN")
+    parser.add_argument("--use-dueling", action="store_true", help="Whether to use Dueling DQN")
     args = parser.parse_args()
 
     if not args.dry:
