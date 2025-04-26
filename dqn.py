@@ -316,7 +316,11 @@ class DQNAgent:
         self.epsilon_min = args.epsilon_min
         
         # 自動計算 epsilon_decay
-        if hasattr(args, 'max_steps'):
+        if hasattr(args, 'epsilon_decay') and args.epsilon_decay is not None:
+            # 如果提供了 epsilon_decay，直接使用設定的值
+            self.epsilon_decay = args.epsilon_decay
+        elif hasattr(args, 'max_steps'):
+            # 只有在沒有設定 epsilon_decay 的情況下，才根據 max_steps 計算
             # 計算需要多少步才能從 epsilon_start 降到 epsilon_min
             # epsilon = epsilon_start * (epsilon_decay)^steps
             # epsilon_min = epsilon_start * (epsilon_decay)^max_steps
@@ -324,7 +328,9 @@ class DQNAgent:
             self.epsilon_decay = (self.epsilon_min / self.epsilon) ** (1.0 / args.max_steps)
             args.epsilon_decay = self.epsilon_decay
         else:
-            self.epsilon_decay = args.epsilon_decay
+            # 如果既沒有設定 epsilon_decay，也沒有設定 max_steps，使用預設值
+            self.epsilon_decay = 0.9999
+            args.epsilon_decay = self.epsilon_decay
 
         self.env_count = 0
         self.train_count = 0
@@ -645,7 +651,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=2.5e-4)
     parser.add_argument("--discount-factor", type=float, default=0.99)
     parser.add_argument("--epsilon-start", type=float, default=1.0)
-    parser.add_argument("--epsilon-decay", type=float, default=0.9999)
+    parser.add_argument("--epsilon-decay", type=float)
     parser.add_argument("--epsilon-min", type=float, default=0.1)
     parser.add_argument("--target-update-frequency", type=int, default=1000)
     parser.add_argument("--replay-start-size", type=int, default=10000)
