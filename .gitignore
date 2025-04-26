@@ -1,0 +1,7 @@
+eval_videos
+result*
+.venv
+*.png
+*.eps
+eval*
+wandb
