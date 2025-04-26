@@ -288,6 +288,7 @@ class DQNAgent:
         self.num_actions = self.env.action_space.n
         self.preprocessor = AtariPreprocessor()
         self.dry = args.dry if hasattr(args, 'dry') else False
+        self.use_ddqn = args.use_ddqn if hasattr(args, 'use_ddqn') else False
         
         # 時間追蹤相關變數
         self.last_time = time.time()
@@ -570,15 +571,19 @@ class DQNAgent:
         
         # 計算當前 Q 值
         current_q_values = self.q_net(states).gather(1, actions.unsqueeze(1))
-        # print("current_q_values.shape:", current_q_values.shape)
         
         # 計算目標 Q 值
         with torch.no_grad():
-            next_q_values = self.target_net(next_states).max(1)[0]
+            if self.use_ddqn:
+                # DDQN: 使用主網路選擇動作，目標網路評估 Q 值
+                next_actions = self.q_net(next_states).max(1)[1]
+                next_q_values = self.target_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+            else:
+                # DQN: 直接使用目標網路的最大 Q 值
+                next_q_values = self.target_net(next_states).max(1)[0]
+            
             target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
             
-        # print("target_q_values.shape:", target_q_values.shape)
-
         # 計算 TD 誤差
         td_errors = (current_q_values.squeeze() - target_q_values).abs().detach().cpu().numpy()
         
@@ -617,8 +622,6 @@ class DQNAgent:
             self.target_net.load_state_dict(self.q_net.state_dict())
             
         if self.train_count % 1000 == 0:
-            # print(f"[Train #{self.train_count}] Loss: {loss.item():.4f} Q mean: {current_q_values.mean().item():.3f} std: {current_q_values.std().item():.3f} min: {current_q_values.min().item():.3f} max: {current_q_values.max().item():.3f}")
-            # print(f"Gradient Norm: {total_grad_norm:.4f} Parameter Norm: {total_param_norm:.4f}")
             if not self.dry:
                 wandb.log({
                     "Train Loss": loss.item(),
@@ -653,6 +656,7 @@ if __name__ == "__main__":
     parser.add_argument("--dry", action="store_true", help="Debug mode: run only 100 steps, no wandb logging")
     parser.add_argument("--eval-episodes", type=int, default=5, help="Number of episodes to evaluate")
     parser.add_argument("--checkpoint-path", type=str, help="Path to checkpoint file")
+    parser.add_argument("--use-ddqn", action="store_true", help="Whether to use Double DQN")
     args = parser.parse_args()
 
     if not args.dry:
