@@ -3,3 +3,7 @@ ale-py==0.10.0
 opencv-python
 wandb
 imageio
+tqdm
+torch
+torchvision
+torchaudio
