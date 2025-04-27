@@ -31,12 +31,61 @@ def init_weights(m):
             nn.init.constant_(m.bias, 0)
 
 
+class NoisyLinear(nn.Module):
+    def __init__(self, in_features, out_features, std_init=0.4):
+        super(NoisyLinear, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.std_init = std_init
+        
+        self.weight_mu = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        self.register_buffer('weight_epsilon', torch.FloatTensor(out_features, in_features))
+        
+        self.bias_mu = nn.Parameter(torch.FloatTensor(out_features))
+        self.bias_sigma = nn.Parameter(torch.FloatTensor(out_features))
+        self.register_buffer('bias_epsilon', torch.FloatTensor(out_features))
+        
+        self.reset_parameters()
+        self.reset_noise()
+    
+    def reset_parameters(self):
+        mu_range = 1 / np.sqrt(self.in_features)
+        self.weight_mu.data.uniform_(-mu_range, mu_range)
+        self.weight_sigma.data.fill_(self.std_init / np.sqrt(self.in_features))
+        self.bias_mu.data.uniform_(-mu_range, mu_range)
+        self.bias_sigma.data.fill_(self.std_init / np.sqrt(self.out_features))
+    
+    def reset_noise(self):
+        epsilon_in = self._scale_noise(self.in_features)
+        epsilon_out = self._scale_noise(self.out_features)
+        
+        self.weight_epsilon.copy_(epsilon_out.ger(epsilon_in))
+        self.bias_epsilon.copy_(self._scale_noise(self.out_features))
+    
+    def _scale_noise(self, size):
+        x = torch.randn(size)
+        x = x.sign().mul(x.abs().sqrt())
+        return x
+    
+    def forward(self, x):
+        if self.training:
+            weight = self.weight_mu + self.weight_sigma.mul(self.weight_epsilon)
+            bias = self.bias_mu + self.bias_sigma.mul(self.bias_epsilon)
+        else:
+            weight = self.weight_mu
+            bias = self.bias_mu
+        
+        return F.linear(x, weight, bias)
+
+
 class DuelingDQN(nn.Module):
-    def __init__(self, num_actions, use_distributional=False, atoms=51):
+    def __init__(self, num_actions, use_distributional=False, atoms=51, use_noisy=False):
         super(DuelingDQN, self).__init__()
         self.num_actions = num_actions
         self.use_distributional = use_distributional
         self.atoms = atoms
+        self.use_noisy = use_noisy
 
         # 共享的卷積層
         self.conv_layers = nn.Sequential(
@@ -48,16 +97,37 @@ class DuelingDQN(nn.Module):
         conv_output_size = 64 * 7 * 7 # 3136
 
         # Value Stream
-        self.value_stream = nn.Sequential(
-            nn.Linear(conv_output_size, 512), nn.ReLU(),
-            nn.Linear(512, atoms if use_distributional else 1) # 輸出 V(s)
-        )
+        if use_noisy:
+            self.value_stream = nn.Sequential(
+                NoisyLinear(conv_output_size, 512), nn.ReLU(),
+                NoisyLinear(512, atoms if use_distributional else 1) # 輸出 V(s)
+            )
+        else:
+            self.value_stream = nn.Sequential(
+                nn.Linear(conv_output_size, 512), nn.ReLU(),
+                nn.Linear(512, atoms if use_distributional else 1) # 輸出 V(s)
+            )
 
         # Advantage Stream
-        self.advantage_stream = nn.Sequential(
-            nn.Linear(conv_output_size, 512), nn.ReLU(),
-            nn.Linear(512, num_actions * atoms if use_distributional else num_actions) # 輸出 A(s, a)
-        )
+        if use_noisy:
+            self.advantage_stream = nn.Sequential(
+                NoisyLinear(conv_output_size, 512), nn.ReLU(),
+                NoisyLinear(512, num_actions * atoms if use_distributional else num_actions) # 輸出 A(s, a)
+            )
+        else:
+            self.advantage_stream = nn.Sequential(
+                nn.Linear(conv_output_size, 512), nn.ReLU(),
+                nn.Linear(512, num_actions * atoms if use_distributional else num_actions) # 輸出 A(s, a)
+            )
+
+    def reset_noise(self):
+        if self.use_noisy:
+            for module in self.value_stream:
+                if isinstance(module, NoisyLinear):
+                    module.reset_noise()
+            for module in self.advantage_stream:
+                if isinstance(module, NoisyLinear):
+                    module.reset_noise()
 
     def forward(self, x):
         # 首先通過共享的卷積層
@@ -92,11 +162,12 @@ class FineGrainedDuelingDQN(nn.Module):
     """
     A Dueling DQN with a potentially finer-grained CNN architecture.
     """
-    def __init__(self, num_actions, use_distributional=False, atoms=51):
+    def __init__(self, num_actions, use_distributional=False, atoms=51, use_noisy=False):
         super(FineGrainedDuelingDQN, self).__init__()
         self.num_actions = num_actions
         self.use_distributional = use_distributional
         self.atoms = atoms
+        self.use_noisy = use_noisy
 
         # 更精細的共享卷積層
         self.conv_layers = nn.Sequential(
@@ -106,31 +177,41 @@ class FineGrainedDuelingDQN(nn.Module):
             nn.Conv2d(128, 128, kernel_size=3, stride=1), nn.ReLU(),
             nn.Flatten()
         )
-        # Need to calculate the output size dynamically or pre-calculate it
-        # For input (4, 84, 84):
-        # (84 - 5) / 2 + 1 = 40.5 -> 40
-        # (40 - 3) / 2 + 1 = 19.5 -> 19
-        # (19 - 3) / 2 + 1 =  8.5 -> 9 (Mistake in thought, should be 8, let's recheck common padding/output size formulas or test)
-        # Let's re-calculate assuming default padding=0:
-        # Conv1: (84 - 5) // 2 + 1 = 79 // 2 + 1 = 39 + 1 = 40. Output: (32, 40, 40)
-        # Conv2: (40 - 3) // 2 + 1 = 37 // 2 + 1 = 18 + 1 = 19. Output: (64, 19, 19)
-        # Conv3: (19 - 3) // 2 + 1 = 16 // 2 + 1 = 8 + 1 = 9.  Output: (128, 9, 9)
-        # Conv4: (9 - 3) // 1 + 1 = 6 // 1 + 1 = 7.          Output: (128, 7, 7)
         conv_output_size = 128 * 7 * 7 # 6272
 
         # Value Stream
-        self.value_stream = nn.Sequential(
-            nn.Linear(conv_output_size, 512), nn.ReLU(),
-            nn.Linear(512, 1) # 輸出 V(s)
-        )
+        if use_noisy:
+            self.value_stream = nn.Sequential(
+                NoisyLinear(conv_output_size, 512), nn.ReLU(),
+                NoisyLinear(512, 1) # 輸出 V(s)
+            )
+        else:
+            self.value_stream = nn.Sequential(
+                nn.Linear(conv_output_size, 512), nn.ReLU(),
+                nn.Linear(512, 1) # 輸出 V(s)
+            )
 
         # Advantage Stream
-        self.advantage_stream = nn.Sequential(
-            nn.Linear(conv_output_size, 512), nn.ReLU(),
-            nn.Linear(512, num_actions) # 輸出 A(s, a)
-        )
-        self.apply(init_weights) # Apply weight initialization
+        if use_noisy:
+            self.advantage_stream = nn.Sequential(
+                NoisyLinear(conv_output_size, 512), nn.ReLU(),
+                NoisyLinear(512, num_actions) # 輸出 A(s, a)
+            )
+        else:
+            self.advantage_stream = nn.Sequential(
+                nn.Linear(conv_output_size, 512), nn.ReLU(),
+                nn.Linear(512, num_actions) # 輸出 A(s, a)
+            )
+        self.apply(init_weights)
 
+    def reset_noise(self):
+        if self.use_noisy:
+            for module in self.value_stream:
+                if isinstance(module, NoisyLinear):
+                    module.reset_noise()
+            for module in self.advantage_stream:
+                if isinstance(module, NoisyLinear):
+                    module.reset_noise()
 
     def forward(self, x):
         # 首先通過共享的卷積層
@@ -148,46 +229,73 @@ class FineGrainedDuelingDQN(nn.Module):
 
 
 class DQN(nn.Module):
-    def __init__(self, env, num_actions, use_distributional=False, atoms=51):
+    def __init__(self, env, num_actions, use_distributional=False, atoms=51, use_noisy=False):
         super(DQN, self).__init__()
         self.env = env
         self.use_distributional = use_distributional
         self.atoms = atoms
+        self.use_noisy = use_noisy
 
         if env == "CartPole-v1":
-            self.network = nn.Sequential(
-                nn.Linear(4, 128), # Increased hidden layer size
-                nn.ReLU(),
-                nn.Linear(128, 128), # Increased hidden layer size
-                nn.ReLU(),
-                nn.Linear(128, num_actions * atoms if use_distributional else num_actions)
-            )
+            if use_noisy:
+                self.network = nn.Sequential(
+                    NoisyLinear(4, 128),
+                    nn.ReLU(),
+                    NoisyLinear(128, 128),
+                    nn.ReLU(),
+                    NoisyLinear(128, num_actions * atoms if use_distributional else num_actions)
+                )
+            else:
+                self.network = nn.Sequential(
+                    nn.Linear(4, 128),
+                    nn.ReLU(),
+                    nn.Linear(128, 128),
+                    nn.ReLU(),
+                    nn.Linear(128, num_actions * atoms if use_distributional else num_actions)
+                )
         elif env == "ALE/Pong-v5":
-            self.network = nn.Sequential(
-                nn.Conv2d(4, 32, kernel_size=8, stride=4),
-                nn.ReLU(),
-                nn.Conv2d(32, 64, kernel_size=4, stride=2),
-                nn.ReLU(),
-                nn.Conv2d(64, 64, kernel_size=3, stride=1),
-                nn.ReLU(),
-                nn.Flatten(),
-                nn.Linear(64 * 7 * 7, 512),
-                nn.ReLU(),
-                nn.Linear(512, num_actions * atoms if use_distributional else num_actions)
-            )
-        self.apply(init_weights) # Apply weight initialization
+            if use_noisy:
+                self.network = nn.Sequential(
+                    nn.Conv2d(4, 32, kernel_size=8, stride=4),
+                    nn.ReLU(),
+                    nn.Conv2d(32, 64, kernel_size=4, stride=2),
+                    nn.ReLU(),
+                    nn.Conv2d(64, 64, kernel_size=3, stride=1),
+                    nn.ReLU(),
+                    nn.Flatten(),
+                    NoisyLinear(64 * 7 * 7, 512),
+                    nn.ReLU(),
+                    NoisyLinear(512, num_actions * atoms if use_distributional else num_actions)
+                )
+            else:
+                self.network = nn.Sequential(
+                    nn.Conv2d(4, 32, kernel_size=8, stride=4),
+                    nn.ReLU(),
+                    nn.Conv2d(32, 64, kernel_size=4, stride=2),
+                    nn.ReLU(),
+                    nn.Conv2d(64, 64, kernel_size=3, stride=1),
+                    nn.ReLU(),
+                    nn.Flatten(),
+                    nn.Linear(64 * 7 * 7, 512),
+                    nn.ReLU(),
+                    nn.Linear(512, num_actions * atoms if use_distributional else num_actions)
+                )
+        self.apply(init_weights)
+
+    def reset_noise(self):
+        if self.use_noisy:
+            for module in self.network:
+                if isinstance(module, NoisyLinear):
+                    module.reset_noise()
 
     def forward(self, x):
-        # CartPole state doesn't need normalization like image data
         if self.env == "CartPole-v1":
             x = self.network(x)
         elif self.env == "ALE/Pong-v5":
             x = self.network(x / 255.0)
             
         if self.use_distributional:
-            # Reshape to (batch_size, num_actions, atoms)
             x = x.view(-1, self.num_actions, self.atoms)
-            # Apply softmax to get probability distribution
             x = F.softmax(x, dim=2)
         return x
 
@@ -468,6 +576,7 @@ class DQNAgent:
         self.use_dueling = args.use_dueling if hasattr(args, 'use_dueling') else False
         self.use_fine_cnn = args.use_fine_cnn if hasattr(args, 'use_fine_cnn') else False
         self.use_distributional = args.use_distributional if hasattr(args, 'use_distributional') else False
+        self.use_noisy = args.use_noisy if hasattr(args, 'use_noisy') else False
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print("Using device:", self.device)
         # Distributional RL 相關參數
@@ -495,20 +604,20 @@ class DQNAgent:
             if self.use_dueling:
                 if self.use_fine_cnn:
                     print("Using Fine-Grained Dueling DQN for Pong")
-                    self.q_net = FineGrainedDuelingDQN(self.num_actions, self.use_distributional, self.atoms).to(self.device)
-                    self.target_net = FineGrainedDuelingDQN(self.num_actions, self.use_distributional, self.atoms).to(self.device)
+                    self.q_net = FineGrainedDuelingDQN(self.num_actions, self.use_distributional, self.atoms, self.use_noisy).to(self.device)
+                    self.target_net = FineGrainedDuelingDQN(self.num_actions, self.use_distributional, self.atoms, self.use_noisy).to(self.device)
                 else:
                     print("Using Dueling DQN for Pong")
-                    self.q_net = DuelingDQN(self.num_actions, self.use_distributional, self.atoms).to(self.device)
-                    self.target_net = DuelingDQN(self.num_actions, self.use_distributional, self.atoms).to(self.device)
+                    self.q_net = DuelingDQN(self.num_actions, self.use_distributional, self.atoms, self.use_noisy).to(self.device)
+                    self.target_net = DuelingDQN(self.num_actions, self.use_distributional, self.atoms, self.use_noisy).to(self.device)
             else:
                  print("Using standard DQN for Pong")
-                 self.q_net = DQN(env_name, self.num_actions, self.use_distributional, self.atoms).to(self.device)
-                 self.target_net = DQN(env_name, self.num_actions, self.use_distributional, self.atoms).to(self.device)
+                 self.q_net = DQN(env_name, self.num_actions, self.use_distributional, self.atoms, self.use_noisy).to(self.device)
+                 self.target_net = DQN(env_name, self.num_actions, self.use_distributional, self.atoms, self.use_noisy).to(self.device)
         else: # For CartPole-v1 or other envs
              print(f"Using standard DQN for {env_name}")
-             self.q_net = DQN(env_name, self.num_actions, self.use_distributional, self.atoms).to(self.device)
-             self.target_net = DQN(env_name, self.num_actions, self.use_distributional, self.atoms).to(self.device)
+             self.q_net = DQN(env_name, self.num_actions, self.use_distributional, self.atoms, self.use_noisy).to(self.device)
+             self.target_net = DQN(env_name, self.num_actions, self.use_distributional, self.atoms, self.use_noisy).to(self.device)
 
         self.q_net.apply(init_weights)
         self.target_net.load_state_dict(self.q_net.state_dict())
@@ -619,7 +728,7 @@ class DQNAgent:
 
 
     def select_action(self, state):
-        if random.random() < self.epsilon:
+        if not self.use_noisy and random.random() < self.epsilon:
             return random.randint(0, self.num_actions - 1)
         state_tensor = torch.from_numpy(np.array(state)).float().unsqueeze(0).to(self.device)
         with torch.no_grad():
@@ -782,7 +891,7 @@ class DQNAgent:
             return 
         
         # Decay function for epsilon-greedy exploration
-        if self.epsilon > self.epsilon_min:
+        if not self.use_noisy and self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
         self.train_count += 1
        
@@ -801,6 +910,11 @@ class DQNAgent:
         rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
         dones = torch.tensor(dones, dtype=torch.float32).to(self.device)
         weights = torch.tensor(weights, dtype=torch.float32).to(self.device)
+
+        # 重置噪聲
+        if self.use_noisy:
+            self.q_net.reset_noise()
+            self.target_net.reset_noise()
 
         if self.use_distributional:
             # 計算當前狀態分佈
@@ -957,13 +1071,13 @@ if __name__ == "__main__":
     parser.add_argument("--env", type=str, default="CartPole-v1", choices=["CartPole-v1", "ALE/Pong-v5"], help="Gym environment name")
     parser.add_argument("--save-dir", type=str, default="./results")
     parser.add_argument("--wandb-run-name", type=str, default="cartpole-run")
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--memory-size", type=int, default=100000)
     parser.add_argument("--lr", type=float, default=2.5e-4)
     parser.add_argument("--discount-factor", type=float, default=0.99)
     parser.add_argument("--epsilon-start", type=float, default=1.0)
-    parser.add_argument("--epsilon-decay", type=float)
-    parser.add_argument("--epsilon-min", type=float, default=0.1)
+    parser.add_argument("--epsilon-decay", type=float, default=0.99995)
+    parser.add_argument("--epsilon-min", type=float, default=0.01)
     parser.add_argument("--target-update-frequency", type=int, default=1000)
     parser.add_argument("--replay-start-size", type=int, default=10000)
     parser.add_argument("--max-episode-steps", type=int, default=10000)
@@ -982,6 +1096,7 @@ if __name__ == "__main__":
     parser.add_argument("--v-min", type=float, default=-10.0, help="Minimum value in the distributional RL support")
     parser.add_argument("--v-max", type=float, default=10.0, help="Maximum value in the distributional RL support")
     parser.add_argument("--atoms", type=int, default=51, help="Number of atoms in the distributional RL support")
+    parser.add_argument("--use-noisy", action="store_true", help="Whether to use NoisyNet")
     args = parser.parse_args()
 
     if not args.dry:
