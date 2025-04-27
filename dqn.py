@@ -18,6 +18,7 @@ import time
 import yaml
 from collections import deque
 from tqdm import tqdm
+import torch.nn.functional as F
 
 
 gym.register_envs(ale_py)
@@ -31,9 +32,11 @@ def init_weights(m):
 
 
 class DuelingDQN(nn.Module):
-    def __init__(self, num_actions):
+    def __init__(self, num_actions, use_distributional=False, atoms=51):
         super(DuelingDQN, self).__init__()
         self.num_actions = num_actions
+        self.use_distributional = use_distributional
+        self.atoms = atoms
 
         # 共享的卷積層
         self.conv_layers = nn.Sequential(
@@ -47,13 +50,13 @@ class DuelingDQN(nn.Module):
         # Value Stream
         self.value_stream = nn.Sequential(
             nn.Linear(conv_output_size, 512), nn.ReLU(),
-            nn.Linear(512, 1) # 輸出 V(s)
+            nn.Linear(512, atoms if use_distributional else 1) # 輸出 V(s)
         )
 
         # Advantage Stream
         self.advantage_stream = nn.Sequential(
             nn.Linear(conv_output_size, 512), nn.ReLU(),
-            nn.Linear(512, num_actions) # 輸出 A(s, a)
+            nn.Linear(512, num_actions * atoms if use_distributional else num_actions) # 輸出 A(s, a)
         )
 
     def forward(self, x):
@@ -64,9 +67,23 @@ class DuelingDQN(nn.Module):
         values = self.value_stream(features)
         advantages = self.advantage_stream(features)
 
-        # 組合 V 和 A -> Q
-        # Q(s, a) = V(s) + (A(s, a) - mean(A(s, a')))
-        q_values = values + (advantages - advantages.mean(1, keepdim=True))
+        if self.use_distributional:
+            # 重塑優勢流輸出為 (batch_size, num_actions, atoms)
+            advantages = advantages.view(-1, self.num_actions, self.atoms)
+            # 重塑價值流輸出為 (batch_size, 1, atoms)
+            values = values.view(-1, 1, self.atoms)
+            
+            # 組合 V 和 A -> Q
+            # Q(s, a) = V(s) + (A(s, a) - mean(A(s, a')))
+            q_values = values + (advantages - advantages.mean(1, keepdim=True))
+            
+            # 應用 softmax 以獲得機率分佈
+            q_values = F.softmax(q_values, dim=2)
+        else:
+            # 標準 Dueling DQN 的組合方式
+            values = values.expand(-1, self.num_actions)
+            advantages = advantages - advantages.mean(1, keepdim=True)
+            q_values = values + advantages
 
         return q_values
 
@@ -75,9 +92,11 @@ class FineGrainedDuelingDQN(nn.Module):
     """
     A Dueling DQN with a potentially finer-grained CNN architecture.
     """
-    def __init__(self, num_actions):
+    def __init__(self, num_actions, use_distributional=False, atoms=51):
         super(FineGrainedDuelingDQN, self).__init__()
         self.num_actions = num_actions
+        self.use_distributional = use_distributional
+        self.atoms = atoms
 
         # 更精細的共享卷積層
         self.conv_layers = nn.Sequential(
@@ -129,9 +148,11 @@ class FineGrainedDuelingDQN(nn.Module):
 
 
 class DQN(nn.Module):
-    def __init__(self, env, num_actions):
+    def __init__(self, env, num_actions, use_distributional=False, atoms=51):
         super(DQN, self).__init__()
         self.env = env
+        self.use_distributional = use_distributional
+        self.atoms = atoms
 
         if env == "CartPole-v1":
             self.network = nn.Sequential(
@@ -139,7 +160,7 @@ class DQN(nn.Module):
                 nn.ReLU(),
                 nn.Linear(128, 128), # Increased hidden layer size
                 nn.ReLU(),
-                nn.Linear(128, num_actions)
+                nn.Linear(128, num_actions * atoms if use_distributional else num_actions)
             )
         elif env == "ALE/Pong-v5":
             self.network = nn.Sequential(
@@ -152,17 +173,23 @@ class DQN(nn.Module):
                 nn.Flatten(),
                 nn.Linear(64 * 7 * 7, 512),
                 nn.ReLU(),
-                nn.Linear(512, num_actions)
+                nn.Linear(512, num_actions * atoms if use_distributional else num_actions)
             )
         self.apply(init_weights) # Apply weight initialization
 
     def forward(self, x):
         # CartPole state doesn't need normalization like image data
-        # print(f"x.shape: {x.shape}")
         if self.env == "CartPole-v1":
-            return self.network(x)
+            x = self.network(x)
         elif self.env == "ALE/Pong-v5":
-            return self.network(x / 255.0)
+            x = self.network(x / 255.0)
+            
+        if self.use_distributional:
+            # Reshape to (batch_size, num_actions, atoms)
+            x = x.view(-1, self.num_actions, self.atoms)
+            # Apply softmax to get probability distribution
+            x = F.softmax(x, dim=2)
+        return x
 
 
 # FIXED
@@ -440,6 +467,16 @@ class DQNAgent:
         self.use_ddqn = args.use_ddqn if hasattr(args, 'use_ddqn') else False
         self.use_dueling = args.use_dueling if hasattr(args, 'use_dueling') else False
         self.use_fine_cnn = args.use_fine_cnn if hasattr(args, 'use_fine_cnn') else False
+        self.use_distributional = args.use_distributional if hasattr(args, 'use_distributional') else False
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("Using device:", self.device)
+        # Distributional RL 相關參數
+        if self.use_distributional:
+            self.v_min = args.v_min if hasattr(args, 'v_min') else -10.0
+            self.v_max = args.v_max if hasattr(args, 'v_max') else 10.0
+            self.atoms = args.atoms if hasattr(args, 'atoms') else 51
+            self.delta_z = (self.v_max - self.v_min) / (self.atoms - 1)
+            self.support = torch.linspace(self.v_min, self.v_max, self.atoms).to(self.device)
         
         # 時間追蹤相關變數
         self.last_time = time.time()
@@ -452,27 +489,26 @@ class DQNAgent:
         else:
             self.memory = ReplayBuffer(args.memory_size, n_step=args.n_step, gamma=args.gamma)
             
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print("Using device:", self.device)
+
         # 根據是否使用 DuelingDQN 選擇網路架構
         if self.env_name == "ALE/Pong-v5":
             if self.use_dueling:
                 if self.use_fine_cnn:
                     print("Using Fine-Grained Dueling DQN for Pong")
-                    self.q_net = FineGrainedDuelingDQN(self.num_actions).to(self.device)
-                    self.target_net = FineGrainedDuelingDQN(self.num_actions).to(self.device)
+                    self.q_net = FineGrainedDuelingDQN(self.num_actions, self.use_distributional, self.atoms).to(self.device)
+                    self.target_net = FineGrainedDuelingDQN(self.num_actions, self.use_distributional, self.atoms).to(self.device)
                 else:
                     print("Using Dueling DQN for Pong")
-                    self.q_net = DuelingDQN(self.num_actions).to(self.device)
-                    self.target_net = DuelingDQN(self.num_actions).to(self.device)
+                    self.q_net = DuelingDQN(self.num_actions, self.use_distributional, self.atoms).to(self.device)
+                    self.target_net = DuelingDQN(self.num_actions, self.use_distributional, self.atoms).to(self.device)
             else:
                  print("Using standard DQN for Pong")
-                 self.q_net = DQN(env_name, self.num_actions).to(self.device)
-                 self.target_net = DQN(env_name, self.num_actions).to(self.device)
+                 self.q_net = DQN(env_name, self.num_actions, self.use_distributional, self.atoms).to(self.device)
+                 self.target_net = DQN(env_name, self.num_actions, self.use_distributional, self.atoms).to(self.device)
         else: # For CartPole-v1 or other envs
              print(f"Using standard DQN for {env_name}")
-             self.q_net = DQN(env_name, self.num_actions).to(self.device)
-             self.target_net = DQN(env_name, self.num_actions).to(self.device)
+             self.q_net = DQN(env_name, self.num_actions, self.use_distributional, self.atoms).to(self.device)
+             self.target_net = DQN(env_name, self.num_actions, self.use_distributional, self.atoms).to(self.device)
 
         self.q_net.apply(init_weights)
         self.target_net.load_state_dict(self.q_net.state_dict())
@@ -515,7 +551,7 @@ class DQNAgent:
         self.avg_reward = 0  # 當前平均獎勵
         self.eval_episodes = args.eval_episodes
 
-                # 儲存超參數到 YAML 檔案
+        # 儲存超參數到 YAML 檔案
         if not self.dry:
             self._save_hyperparameters(args)
 
@@ -546,7 +582,13 @@ class DQNAgent:
             'use_prioritized_replay': args.use_prioritized_replay,
             'eval_episodes': args.eval_episodes,
             'use_dueling': args.use_dueling,
-            'use_fine_cnn': args.use_fine_cnn
+            'use_fine_cnn': args.use_fine_cnn,
+            'use_distributional': args.use_distributional,
+            'v_min': self.v_min,
+            'v_max': self.v_max,
+            'atoms': self.atoms,
+            'delta_z': self.delta_z,
+            'support': self.support.tolist()
         }
         
         # 建立超參數檔案的路徑
@@ -581,7 +623,13 @@ class DQNAgent:
             return random.randint(0, self.num_actions - 1)
         state_tensor = torch.from_numpy(np.array(state)).float().unsqueeze(0).to(self.device)
         with torch.no_grad():
-            q_values = self.q_net(state_tensor)
+            if self.use_distributional:
+                # 對於分佈式 RL，我們需要計算每個動作的期望值
+                q_dist = self.q_net(state_tensor)
+                # 計算期望值：sum(p * z)，其中 z 是支援點
+                q_values = (q_dist * self.support).sum(dim=2)
+            else:
+                q_values = self.q_net(state_tensor)
         return q_values.argmax().item()
 
     def run(self, max_steps=1000000):
@@ -708,7 +756,14 @@ class DQNAgent:
             while not done:
                 state_tensor = torch.from_numpy(np.array(state)).float().unsqueeze(0).to(self.device)
                 with torch.no_grad():
-                    action = self.q_net(state_tensor).argmax().item()
+                    if self.use_distributional:
+                        # 對於分佈式 RL，我們需要計算每個動作的期望值
+                        q_dist = self.q_net(state_tensor)
+                        # 計算期望值：sum(p * z)，其中 z 是支援點
+                        q_values = (q_dist * self.support).sum(dim=2)
+                    else:
+                        q_values = self.q_net(state_tensor)
+                    action = q_values.argmax().item()
                 next_obs, reward, terminated, truncated, _ = self.test_env.step(action)
                 done = terminated or truncated
                 total_reward += reward
@@ -747,30 +802,66 @@ class DQNAgent:
         dones = torch.tensor(dones, dtype=torch.float32).to(self.device)
         weights = torch.tensor(weights, dtype=torch.float32).to(self.device)
 
-        
-        # 計算當前 Q 值
-        current_q_values = self.q_net(states).gather(1, actions.unsqueeze(1))
-        
-        # 計算目標 Q 值
-        with torch.no_grad():
-            if self.use_ddqn:
-                # DDQN: 使用主網路選擇動作，目標網路評估 Q 值
-                next_actions = self.q_net(next_states).max(1)[1]
-                next_q_values = self.target_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
-            else:
-                # DQN: 直接使用目標網路的最大 Q 值
-                next_q_values = self.target_net(next_states).max(1)[0]
+        if self.use_distributional:
+            # 計算當前狀態分佈
+            current_dist = self.q_net(states)
+            current_dist = current_dist[range(self.batch_size), actions]
             
-            target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
+            # 計算下一個狀態分佈
+            with torch.no_grad():
+                next_dist = self.target_net(next_states)
+                next_actions = next_dist.mean(2).max(1)[1]
+                next_dist = next_dist[range(self.batch_size), next_actions]
+                
+                # 投影下一個狀態分佈
+                rewards = rewards.unsqueeze(1)
+                dones = dones.unsqueeze(1)
+                support = self.support.unsqueeze(0)
+                
+                Tz = rewards + (1 - dones) * self.gamma * support
+                Tz = Tz.clamp(self.v_min, self.v_max)
+                b = (Tz - self.v_min) / self.delta_z
+                l = b.floor().long()
+                u = b.ceil().long()
+                
+                # 修復消失的機率質量
+                l[(u > 0) * (l == u)] -= 1
+                u[(l < (self.atoms - 1)) * (l == u)] += 1
+                
+                # 分配機率
+                m = torch.zeros(self.batch_size, self.atoms, device=self.device)
+                offset = torch.linspace(0, (self.batch_size - 1) * self.atoms, self.batch_size, device=self.device).unsqueeze(1).expand(self.batch_size, self.atoms).long()
+                m.view(-1).index_add_(0, (l + offset).view(-1), (next_dist * (u.float() - b)).view(-1))
+                m.view(-1).index_add_(0, (u + offset).view(-1), (next_dist * (b - l.float())).view(-1))
             
-        # 計算 TD 誤差
-        td_errors = (current_q_values.squeeze() - target_q_values).abs().detach().cpu().numpy()
+            # 計算交叉熵損失
+            loss = -(m * current_dist.log()).sum(1).mean()
+            
+            # 計算 TD 誤差
+            td_errors = (current_dist - m).abs().sum(1).detach().cpu().numpy()
+        else:
+            # 標準 DQN 損失計算
+            current_q_values = self.q_net(states).gather(1, actions.unsqueeze(1))
+            
+            with torch.no_grad():
+                if self.use_ddqn:
+                    # DDQN: 使用主網路選擇動作，目標網路評估 Q 值
+                    next_actions = self.q_net(next_states).max(1)[1]
+                    next_q_values = self.target_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+                else:
+                    # DQN: 直接使用目標網路的最大 Q 值
+                    next_q_values = self.target_net(next_states).max(1)[0]
+                
+                target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
+            
+            # 計算 TD 誤差
+            td_errors = (current_q_values.squeeze() - target_q_values).abs().detach().cpu().numpy()
+            
+            # 計算加權損失
+            loss = (weights * (current_q_values.squeeze() - target_q_values).pow(2)).mean()
         
         # 更新優先級
         self.memory.update_priorities(indices, td_errors)
-        
-        # 計算加權損失
-        loss = (weights * (current_q_values.squeeze() - target_q_values).pow(2)).mean()
         
         # 優化步驟
         self.optimizer.zero_grad()
@@ -804,14 +895,61 @@ class DQNAgent:
             if not self.dry:
                 wandb.log({
                     "Train Loss": loss.item(),
-                    "Q Value Mean": current_q_values.mean().item(),
-                    "Q Value Std": current_q_values.std().item(),
-                    "Q Value Min": current_q_values.min().item(),
-                    "Q Value Max": current_q_values.max().item(),
+                    "Q Value Mean": current_q_values.mean().item() if not self.use_distributional else (current_dist * self.support).sum(1).mean().item(),
+                    "Q Value Std": current_q_values.std().item() if not self.use_distributional else (current_dist * self.support).sum(1).std().item(),
+                    "Q Value Min": current_q_values.min().item() if not self.use_distributional else (current_dist * self.support).sum(1).min().item(),
+                    "Q Value Max": current_q_values.max().item() if not self.use_distributional else (current_dist * self.support).sum(1).max().item(),
                     "Gradient Norm": total_grad_norm,
                     "Parameter Norm": total_param_norm,
                     "Epsilon": self.epsilon
                 })
+
+    def compute_loss(self, batch):
+        states, actions, rewards, next_states, dones = batch
+        
+        if self.use_distributional:
+            # Get current state distribution
+            current_dist = self.q_net(states)
+            current_dist = current_dist[range(self.batch_size), actions]
+            
+            # Get next state distribution
+            with torch.no_grad():
+                next_dist = self.target_net(next_states)
+                next_actions = next_dist.mean(2).max(1)[1]
+                next_dist = next_dist[range(self.batch_size), next_actions]
+                
+                # Project next state distribution
+                rewards = rewards.unsqueeze(1)
+                dones = dones.unsqueeze(1)
+                support = self.support.unsqueeze(0)
+                
+                Tz = rewards + (1 - dones) * self.gamma * support
+                Tz = Tz.clamp(self.v_min, self.v_max)
+                b = (Tz - self.v_min) / self.delta_z
+                l = b.floor().long()
+                u = b.ceil().long()
+                
+                # Fix disappearing probability mass
+                l[(u > 0) * (l == u)] -= 1
+                u[(l < (self.atoms - 1)) * (l == u)] += 1
+                
+                # Distribute probability
+                m = torch.zeros(self.batch_size, self.atoms, device=self.device)
+                offset = torch.linspace(0, (self.batch_size - 1) * self.atoms, self.batch_size).unsqueeze(1).expand(self.batch_size, self.atoms).long()
+                m.view(-1).index_add_(0, (l + offset).view(-1), (next_dist * (u.float() - b)).view(-1))
+                m.view(-1).index_add_(0, (u + offset).view(-1), (next_dist * (b - l.float())).view(-1))
+            
+            # Compute cross entropy loss
+            loss = -(m * current_dist.log()).sum(1).mean()
+        else:
+            # Standard DQN loss
+            current_q_values = self.q_net(states).gather(1, actions)
+            with torch.no_grad():
+                next_q_values = self.target_net(next_states).max(1)[0].unsqueeze(1)
+                target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
+            loss = F.smooth_l1_loss(current_q_values, target_q_values)
+            
+        return loss
 
 
 if __name__ == "__main__":
@@ -840,6 +978,10 @@ if __name__ == "__main__":
     parser.add_argument("--use-fine-cnn", action="store_true", help="Whether to use a finer-grained CNN architecture for Pong")
     parser.add_argument("--n-step", type=int, default=1, help="Number of steps for N-step returns")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor for N-step returns")
+    parser.add_argument("--use-distributional", action="store_true", help="Whether to use Distributional RL")
+    parser.add_argument("--v-min", type=float, default=-10.0, help="Minimum value in the distributional RL support")
+    parser.add_argument("--v-max", type=float, default=10.0, help="Maximum value in the distributional RL support")
+    parser.add_argument("--atoms", type=int, default=51, help="Number of atoms in the distributional RL support")
     args = parser.parse_args()
 
     if not args.dry:
