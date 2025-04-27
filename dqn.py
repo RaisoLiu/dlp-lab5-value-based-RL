@@ -105,9 +105,6 @@ class DQN(nn.Module):
         if self.env == "CartPole-v1":
             return self.network(x)
         elif self.env == "ALE/Pong-v5":
-            # 將 4 通道的輸入轉換為 3 通道
-            # if x.shape[1] == 4:  # 如果是 4 通道
-                # x = x[:, :3, :, :]  # 只取前 3 個通道
             return self.network(x / 255.0)
 
 
@@ -172,16 +169,46 @@ class ReplayBuffer:
     """
         A simple FIFO replay buffer
     """
-    def __init__(self, capacity):
+    def __init__(self, capacity, n_step=1, gamma=0.99):
         self.capacity = capacity
         self.buffer = []
         self.pos = 0
+        self.n_step = n_step
+        self.gamma = gamma
+        self.n_step_buffer = []
+
+    def clean(self):
+        """清空 n_step_buffer"""
+        self.n_step_buffer = []
 
     def add(self, transition, error=None):
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(None)
-        self.buffer[self.pos] = transition
-        self.pos = (self.pos + 1) % self.capacity
+        # 將新的轉換添加到 n_step_buffer
+        self.n_step_buffer.append(transition)
+        
+        # 如果 n_step_buffer 已滿，計算 n-step 獎勵並存儲
+        if len(self.n_step_buffer) >= self.n_step:
+            # 計算 n-step 獎勵
+            n_step_reward = 0
+            for i in range(self.n_step):
+                n_step_reward += self.gamma ** i * self.n_step_buffer[i][2]  # 2 是 reward 的位置
+            
+            # 創建新的轉換元組
+            n_step_transition = (
+                self.n_step_buffer[0][0],  # 初始狀態
+                self.n_step_buffer[0][1],  # 初始動作
+                n_step_reward,             # n-step 獎勵
+                self.n_step_buffer[-1][3], # 最終狀態
+                self.n_step_buffer[-1][4]  # 最終 done 標誌
+            )
+            
+            # 存儲到主緩衝區
+            if len(self.buffer) < self.capacity:
+                self.buffer.append(None)
+            self.buffer[self.pos] = n_step_transition
+            self.pos = (self.pos + 1) % self.capacity
+            
+            # 移除最舊的轉換
+            self.n_step_buffer.pop(0)
 
     def sample(self, batch_size):
         if len(self.buffer) < batch_size:
@@ -202,7 +229,7 @@ class PrioritizedReplayBuffer:
         Prioritizing the samples in the replay memory by the Bellman error
         See the paper (Schaul et al., 2016) at https://arxiv.org/abs/1511.05952
     """
-    def __init__(self, capacity, alpha=0.6, beta=0.4, beta_increment_per_sampling=0.001, epsilon=1e-5):
+    def __init__(self, capacity, alpha=0.6, beta=0.4, beta_increment_per_sampling=0.001, epsilon=1e-5, n_step=1, gamma=0.99):
         """
         Initialize the Prioritized Replay Buffer.
 
@@ -212,6 +239,8 @@ class PrioritizedReplayBuffer:
             beta (float): Controls the degree of importance sampling correction. beta=1 means full correction. [cite: 52]
             beta_increment_per_sampling (float): Amount to increase beta each time sample() is called.
             epsilon (float): Small constant added to priorities to ensure non-zero probability. [cite: 50]
+            n_step (int): Number of steps for N-step returns.
+            gamma (float): Discount factor for N-step returns.
         """
         self.capacity = capacity
         self.alpha = alpha
@@ -220,8 +249,15 @@ class PrioritizedReplayBuffer:
         self.epsilon = epsilon  # Small amount to avoid zero priority
         self.buffer = [None] * capacity # Initialize buffer with None
         self.priorities = np.zeros((capacity,), dtype=np.float32)
-        self.pos = 0 # Current insertion position
-        self.size = 0 # Current number of items in buffer
+        self.pos = 0
+        self.size = 0
+        self.n_step = n_step
+        self.gamma = gamma
+        self.n_step_buffer = []
+
+    def clean(self):
+        """清空 n_step_buffer"""
+        self.n_step_buffer = []
 
     def add(self, transition, error):
         """
@@ -231,25 +267,40 @@ class PrioritizedReplayBuffer:
             transition (tuple): The experience tuple (state, action, reward, next_state, done).
             error (float): The TD error (Bellman error) for this transition.
         """
-        ########## YOUR CODE HERE (for Task 3) ##########
-        # Calculate priority: p = |error| + epsilon [cite: 47, 50]
-        priority = abs(error) + self.epsilon
-        # Use maximum priority found so far for new experiences if buffer isn't empty,
-        # otherwise use 1.0. This helps ensure new samples get sampled at least once.
-        max_priority = np.max(self.priorities) if self.size > 0 else 1.0
-        if max_priority == 0: # Handle edge case where buffer was filled with 0 priority items
-             max_priority = 1.0
-
-        # Store transition in the buffer
-        self.buffer[self.pos] = transition
-        # Store priority in the priorities array
-        self.priorities[self.pos] = max_priority # Set initial priority to max priority
-
-        # Update position and size
-        self.pos = (self.pos + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
-        ########## END OF YOUR CODE (for Task 3) ##########
-        return
+        # 將新的轉換添加到 n_step_buffer
+        self.n_step_buffer.append(transition)
+        
+        # 如果 n_step_buffer 已滿，計算 n-step 獎勵並存儲
+        if len(self.n_step_buffer) >= self.n_step:
+            # 計算 n-step 獎勵
+            n_step_reward = 0
+            for i in range(self.n_step):
+                n_step_reward += self.gamma ** i * self.n_step_buffer[i][2]  # 2 是 reward 的位置
+            
+            # 創建新的轉換元組
+            n_step_transition = (
+                self.n_step_buffer[0][0],  # 初始狀態
+                self.n_step_buffer[0][1],  # 初始動作
+                n_step_reward,             # n-step 獎勵
+                self.n_step_buffer[-1][3], # 最終狀態
+                self.n_step_buffer[-1][4]  # 最終 done 標誌
+            )
+            
+            # 計算優先級
+            priority = abs(error) + self.epsilon
+            max_priority = np.max(self.priorities) if self.size > 0 else 1.0
+            if max_priority == 0:
+                max_priority = 1.0
+            
+            # 存儲到主緩衝區
+            self.buffer[self.pos] = n_step_transition
+            self.priorities[self.pos] = max_priority
+            
+            self.pos = (self.pos + 1) % self.capacity
+            self.size = min(self.size + 1, self.capacity)
+            
+            # 移除最舊的轉換
+            self.n_step_buffer.pop(0)
 
     def sample(self, batch_size):
         """
@@ -339,9 +390,9 @@ class DQNAgent:
         
         # 根據參數選擇使用哪種 replay buffer
         if args.use_prioritized_replay:
-            self.memory = PrioritizedReplayBuffer(args.memory_size)
+            self.memory = PrioritizedReplayBuffer(args.memory_size, n_step=args.n_step, gamma=args.gamma)
         else:
-            self.memory = ReplayBuffer(args.memory_size)
+            self.memory = ReplayBuffer(args.memory_size, n_step=args.n_step, gamma=args.gamma)
             
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print("Using device:", self.device)
@@ -483,6 +534,9 @@ class DQNAgent:
             total_reward = 0
             step_count = 0
 
+            # 清空 n_step_buffer
+            self.memory.clean()
+
             while not done and step_count < self.max_episode_steps and total_steps < max_steps:
                 action = self.select_action(state)
                 next_obs, reward, terminated, truncated, _ = self.env.step(action)
@@ -587,7 +641,7 @@ class DQNAgent:
                 next_obs, reward, terminated, truncated, _ = self.test_env.step(action)
                 done = terminated or truncated
                 total_reward += reward
-                if "ALE/Pong-v5" in self.env_name:  
+                if "ALE/Pong-v5" in self.env_name:
                     state = self.preprocessor.step(next_obs)
                 else:
                     state = next_obs
@@ -712,6 +766,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint-path", type=str, help="Path to checkpoint file")
     parser.add_argument("--use-ddqn", action="store_true", help="Whether to use Double DQN")
     parser.add_argument("--use-dueling", action="store_true", help="Whether to use Dueling DQN")
+    parser.add_argument("--n-step", type=int, default=1, help="Number of steps for N-step returns")
+    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor for N-step returns")
     args = parser.parse_args()
 
     if not args.dry:
