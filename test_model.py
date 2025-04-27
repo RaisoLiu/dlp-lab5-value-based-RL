@@ -114,7 +114,7 @@ class AtariPreprocessor:
         self.frames.append(frame.copy())
         stacked = np.stack(self.frames, axis=0)
         return stacked
-        
+
 def evaluate(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -126,68 +126,112 @@ def evaluate(args):
     env.action_space.seed(args.seed)
     env.observation_space.seed(args.seed)
 
-    preprocessor = AtariPreprocessor()
+    is_atari = "ALE/" in args.env
+    if is_atari:
+        preprocessor = AtariPreprocessor()
     num_actions = env.action_space.n
 
-    # 載入超參數
+    # 嘗試載入超參數以確定是否使用 Dueling DQN
+    hyperparams = {}
     hyperparams_path = os.path.join(os.path.dirname(args.model_path), 'hyperparameters.yaml')
-    with open(hyperparams_path, 'r') as f:
-        hyperparams = yaml.safe_load(f)
-    
-    # 根據超參數選擇模型
-    if hyperparams.get('use_dueling', False) and args.env == "ALE/Pong-v5":
+    if os.path.exists(hyperparams_path):
+        try:
+            with open(hyperparams_path, 'r') as f:
+                hyperparams = yaml.safe_load(f)
+        except Exception as e:
+            print(f"Warning: Could not load hyperparameters from {hyperparams_path}: {e}")
+
+    # 根據超參數和環境選擇模型
+    if hyperparams.get('use_dueling', False) and is_atari:
+        print("Loading Dueling DQN model.")
         model = DuelingDQN(num_actions).to(device)
     else:
+        print("Loading standard DQN model.")
         model = DQN(args.env, num_actions).to(device)
-    
-    checkpoint = torch.load(args.model_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+
+    # 載入模型權重
+    try:
+        checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
+        if 'model_state_dict' in checkpoint:
+             model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+             # 如果 checkpoint 只包含 state_dict
+             model.load_state_dict(checkpoint)
+        print(f"Model loaded successfully from {args.model_path}")
+    except Exception as e:
+        print(f"Error loading model from {args.model_path}: {e}")
+        return # Or handle the error appropriately
+
     model.eval()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # 記錄影片
-    if args.record:
-        video_writer = imageio.get_writer(os.path.join(args.output_dir, 'test.mp4'), fps=30)
+    total_reward_list = []
+    for ep in range(args.episodes):
+        obs, _ = env.reset(seed=args.seed + ep)
 
-    total_reward = 0
-    obs, _ = env.reset()
-    state = preprocessor.reset(obs)
-    done = False
-    step = 0
+        # 根據環境選擇適當的狀態處理方式
+        if is_atari:
+            state = preprocessor.reset(obs)
+        else:
+            state = obs
 
-    while not done and step < args.max_steps:
-        state_tensor = torch.from_numpy(np.array(state)).float().unsqueeze(0).to(device)
-        with torch.no_grad():
-            q_values = model(state_tensor)
-            action = q_values.argmax().item()
+        done = False
+        total_reward = 0
+        frames = []
+        # frame_idx = 0 # Not used in the old version logic
 
-        next_obs, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
-        next_state = preprocessor.step(next_obs)
+        while not done:
+            frame = env.render()
+            frames.append(frame)
 
-        total_reward += reward
-        state = next_state
-        step += 1
+            # 轉換 state 為 tensor
+            if isinstance(state, np.ndarray):
+                state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(device)
+            else: # Assuming it might be a tuple or other structure for non-Atari envs initially
+                 state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
 
-        if args.record:
-            video_writer.append_data(env.render())
+            with torch.no_grad():
+                q_values = model(state_tensor)
+                action = q_values.argmax().item()
 
-    if args.record:
-        video_writer.close()
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            total_reward += reward
 
-    print(f"Total reward: {total_reward}")
-    return total_reward
+            # 根據環境選擇適當的狀態更新方式
+            if is_atari:
+                state = preprocessor.step(next_obs)
+            else:
+                state = next_obs
 
+            # frame_idx += 1 # Not used in the old version logic
+
+        out_path = os.path.join(args.output_dir, f"eval_ep{ep}.mp4")
+        try:
+            with imageio.get_writer(out_path, fps=30) as video:
+                for f in frames:
+                    video.append_data(f)
+            print(f"Saved episode {ep} with total reward {total_reward} -> {out_path}")
+        except Exception as e:
+            print(f"Error saving video for episode {ep}: {e}")
+
+
+        total_reward_list.append(total_reward)
+
+
+    if total_reward_list:
+        print(f"Average reward over {args.episodes} episodes: {np.mean(total_reward_list):.2f}")
+    else:
+        print("No episodes were completed.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model-path", type=str, required=True, help="Path to trained .pt model")
+    parser.add_argument("--output-dir", type=str, default="./eval_videos", help="Directory to save evaluation videos")
+    parser.add_argument("--episodes", type=int, default=3, help="Number of episodes to evaluate")
+    parser.add_argument("--seed", type=int, default=313551076, help="Random seed for evaluation")
     parser.add_argument("--env", type=str, default="CartPole-v1", choices=["CartPole-v1", "ALE/Pong-v5"], help="Gym environment name")
-    parser.add_argument("--model-path", type=str, required=True, help="Path to the model checkpoint")
-    parser.add_argument("--output-dir", type=str, default="./test_results", help="Directory to save test results")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--max-steps", type=int, default=10000, help="Maximum number of steps per episode")
-    parser.add_argument("--record", action="store_true", help="Whether to record the test episode")
     args = parser.parse_args()
 
     evaluate(args)
