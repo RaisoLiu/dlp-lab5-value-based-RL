@@ -71,6 +71,63 @@ class DuelingDQN(nn.Module):
         return q_values
 
 
+class FineGrainedDuelingDQN(nn.Module):
+    """
+    A Dueling DQN with a potentially finer-grained CNN architecture.
+    """
+    def __init__(self, num_actions):
+        super(FineGrainedDuelingDQN, self).__init__()
+        self.num_actions = num_actions
+
+        # 更精細的共享卷積層
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(4, 32, kernel_size=5, stride=2), nn.ReLU(),  # Smaller kernel, stride 2
+            nn.Conv2d(32, 64, kernel_size=3, stride=2), nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2), nn.ReLU(), # Added a layer
+            nn.Conv2d(128, 128, kernel_size=3, stride=1), nn.ReLU(),
+            nn.Flatten()
+        )
+        # Need to calculate the output size dynamically or pre-calculate it
+        # For input (4, 84, 84):
+        # (84 - 5) / 2 + 1 = 40.5 -> 40
+        # (40 - 3) / 2 + 1 = 19.5 -> 19
+        # (19 - 3) / 2 + 1 =  8.5 -> 9 (Mistake in thought, should be 8, let's recheck common padding/output size formulas or test)
+        # Let's re-calculate assuming default padding=0:
+        # Conv1: (84 - 5) // 2 + 1 = 79 // 2 + 1 = 39 + 1 = 40. Output: (32, 40, 40)
+        # Conv2: (40 - 3) // 2 + 1 = 37 // 2 + 1 = 18 + 1 = 19. Output: (64, 19, 19)
+        # Conv3: (19 - 3) // 2 + 1 = 16 // 2 + 1 = 8 + 1 = 9.  Output: (128, 9, 9)
+        # Conv4: (9 - 3) // 1 + 1 = 6 // 1 + 1 = 7.          Output: (128, 7, 7)
+        conv_output_size = 128 * 7 * 7 # 6272
+
+        # Value Stream
+        self.value_stream = nn.Sequential(
+            nn.Linear(conv_output_size, 512), nn.ReLU(),
+            nn.Linear(512, 1) # 輸出 V(s)
+        )
+
+        # Advantage Stream
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(conv_output_size, 512), nn.ReLU(),
+            nn.Linear(512, num_actions) # 輸出 A(s, a)
+        )
+        self.apply(init_weights) # Apply weight initialization
+
+
+    def forward(self, x):
+        # 首先通過共享的卷積層
+        features = self.conv_layers(x / 255.0) # 歸一化
+
+        # 分別計算 V(s) 和 A(s, a)
+        values = self.value_stream(features)
+        advantages = self.advantage_stream(features)
+
+        # 組合 V 和 A -> Q
+        # Q(s, a) = V(s) + (A(s, a) - mean(A(s, a')))
+        q_values = values + (advantages - advantages.mean(1, keepdim=True))
+
+        return q_values
+
+
 class DQN(nn.Module):
     def __init__(self, env, num_actions):
         super(DQN, self).__init__()
@@ -382,6 +439,7 @@ class DQNAgent:
         self.dry = args.dry if hasattr(args, 'dry') else False
         self.use_ddqn = args.use_ddqn if hasattr(args, 'use_ddqn') else False
         self.use_dueling = args.use_dueling if hasattr(args, 'use_dueling') else False
+        self.use_fine_cnn = args.use_fine_cnn if hasattr(args, 'use_fine_cnn') else False
         
         # 時間追蹤相關變數
         self.last_time = time.time()
@@ -397,12 +455,24 @@ class DQNAgent:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print("Using device:", self.device)
         # 根據是否使用 DuelingDQN 選擇網路架構
-        if self.use_dueling and self.env_name == "ALE/Pong-v5":
-            self.q_net = DuelingDQN(self.num_actions).to(self.device)
-            self.target_net = DuelingDQN(self.num_actions).to(self.device)
-        else:
-            self.q_net = DQN(env_name, self.num_actions).to(self.device)
-            self.target_net = DQN(env_name, self.num_actions).to(self.device)
+        if self.env_name == "ALE/Pong-v5":
+            if self.use_dueling:
+                if self.use_fine_cnn:
+                    print("Using Fine-Grained Dueling DQN for Pong")
+                    self.q_net = FineGrainedDuelingDQN(self.num_actions).to(self.device)
+                    self.target_net = FineGrainedDuelingDQN(self.num_actions).to(self.device)
+                else:
+                    print("Using Dueling DQN for Pong")
+                    self.q_net = DuelingDQN(self.num_actions).to(self.device)
+                    self.target_net = DuelingDQN(self.num_actions).to(self.device)
+            else:
+                 print("Using standard DQN for Pong")
+                 self.q_net = DQN(env_name, self.num_actions).to(self.device)
+                 self.target_net = DQN(env_name, self.num_actions).to(self.device)
+        else: # For CartPole-v1 or other envs
+             print(f"Using standard DQN for {env_name}")
+             self.q_net = DQN(env_name, self.num_actions).to(self.device)
+             self.target_net = DQN(env_name, self.num_actions).to(self.device)
 
         self.q_net.apply(init_weights)
         self.target_net.load_state_dict(self.q_net.state_dict())
@@ -475,7 +545,8 @@ class DQNAgent:
             'train_per_step': args.train_per_step,
             'use_prioritized_replay': args.use_prioritized_replay,
             'eval_episodes': args.eval_episodes,
-            'use_dueling': args.use_dueling
+            'use_dueling': args.use_dueling,
+            'use_fine_cnn': args.use_fine_cnn
         }
         
         # 建立超參數檔案的路徑
@@ -762,10 +833,11 @@ if __name__ == "__main__":
     parser.add_argument("--max-steps", type=int, default=1000000, help="Maximum number of steps to train")
     parser.add_argument("--use-prioritized-replay", action="store_true", help="Whether to use prioritized experience replay")
     parser.add_argument("--dry", action="store_true", help="Debug mode: run only 100 steps, no wandb logging")
-    parser.add_argument("--eval-episodes", type=int, default=5, help="Number of episodes to evaluate")
+    parser.add_argument("--eval-episodes", type=int, default=10, help="Number of episodes to evaluate")
     parser.add_argument("--checkpoint-path", type=str, help="Path to checkpoint file")
     parser.add_argument("--use-ddqn", action="store_true", help="Whether to use Double DQN")
     parser.add_argument("--use-dueling", action="store_true", help="Whether to use Dueling DQN")
+    parser.add_argument("--use-fine-cnn", action="store_true", help="Whether to use a finer-grained CNN architecture for Pong")
     parser.add_argument("--n-step", type=int, default=1, help="Number of steps for N-step returns")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor for N-step returns")
     args = parser.parse_args()
