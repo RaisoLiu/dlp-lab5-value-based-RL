@@ -579,13 +579,23 @@ class DQNAgent:
         self.use_noisy = args.use_noisy if hasattr(args, 'use_noisy') else False
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print("Using device:", self.device)
+        
+        # 設置 atoms 的預設值
+        self.atoms = args.atoms if hasattr(args, 'atoms') else 51
+        
+        # 設置 v_min 和 v_max 的預設值
+        self.v_min = args.v_min if hasattr(args, 'v_min') else -10.0
+        self.v_max = args.v_max if hasattr(args, 'v_max') else 10.0
+        
+        # 設置 delta_z 的預設值
+        self.delta_z = (self.v_max - self.v_min) / (self.atoms - 1)
+        
+        # 設置 support 的預設值
+        self.support = torch.linspace(self.v_min, self.v_max, self.atoms).to(self.device)
+        
         # Distributional RL 相關參數
         if self.use_distributional:
-            self.v_min = args.v_min if hasattr(args, 'v_min') else -10.0
-            self.v_max = args.v_max if hasattr(args, 'v_max') else 10.0
-            self.atoms = args.atoms if hasattr(args, 'atoms') else 51
-            self.delta_z = (self.v_max - self.v_min) / (self.atoms - 1)
-            self.support = torch.linspace(self.v_min, self.v_max, self.atoms).to(self.device)
+            pass  # 所有必要的參數都已經設置好了
         
         # 時間追蹤相關變數
         self.last_time = time.time()
