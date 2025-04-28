@@ -560,84 +560,92 @@ class DQNAgent:
 
         states = torch.from_numpy(np.array(states)).float().to(self.device)
         next_states = torch.from_numpy(np.array(next_states)).float().to(self.device)
-        actions = torch.tensor(actions, dtype=torch.int64).to(self.device)
+        actions = torch.tensor(actions, dtype=torch.int64).to(self.device) # Shape: [B]
         rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
         dones = torch.tensor(dones, dtype=torch.float32).to(self.device)
         if self.args.use_per:
-            weights = torch.from_numpy(weights).float().to(self.device)
+             weights = torch.from_numpy(weights).float().to(self.device)
 
         if self.args.use_distributional:
-            # 獲取當前狀態分佈
-            current_dist, _ = self.q_net(states)
-            current_dist = current_dist[range(self.batch_size), actions]
-            
-            # 獲取下一個狀態分佈
             with torch.no_grad():
                 if self.args.use_double_dqn:
-                    next_dist_online, _ = self.q_net(next_states)
-                    next_q_values_online = (next_dist_online * self.support).sum(2)
-                    next_actions = next_q_values_online.argmax(1)
-                    next_dist_target, _ = self.target_net(next_states)
-                    next_dist = next_dist_target[range(self.batch_size), next_actions]
+                    next_q_dist_online, _ = self.q_net(next_states)
+                    next_q_values_online = (next_q_dist_online * self.support).sum(2)
+                    next_actions = next_q_values_online.argmax(1) # Shape: [B]
+                    next_q_dist_target, _ = self.target_net(next_states) # Shape: [B, A, N_atoms]
+                    # Gather target distribution for next actions selected by online net
+                    next_dist = next_q_dist_target[range(self.batch_size), next_actions] # Shape: [B, N_atoms]
                 else:
-                    next_dist_target, _ = self.target_net(next_states)
-                    next_q_values_target = (next_dist_target * self.support).sum(2)
-                    next_actions = next_q_values_target.argmax(1)
-                    next_dist = next_dist_target[range(self.batch_size), next_actions]
-                
-                # 投影下一個狀態分佈
+                    next_q_dist_target, _ = self.target_net(next_states) # Shape: [B, A, N_atoms]
+                    next_q_values_target = (next_q_dist_target * self.support).sum(2)
+                    next_actions = next_q_values_target.argmax(1) # Shape: [B]
+                    next_dist = next_q_dist_target[range(self.batch_size), next_actions] # Shape: [B, N_atoms]
+
                 gamma = self.gamma ** self.n_steps if self.use_multistep else self.gamma
-                Tz = rewards.unsqueeze(1) + gamma * self.support.unsqueeze(0) * (1 - dones.unsqueeze(1))
+                Tz = rewards.unsqueeze(1) + gamma * self.support.unsqueeze(0) * (1 - dones.unsqueeze(1)) # Shape: [B, N_atoms]
                 Tz = Tz.clamp(self.args.v_min, self.args.v_max)
-                
+
                 b = (Tz - self.args.v_min) / self.delta_z
                 l = b.floor().long()
                 u = b.ceil().long()
-                
-                # 修復邊界情況
-                l = torch.max(l, torch.zeros_like(l))
-                u = torch.min(u, torch.full_like(u, self.args.num_atoms - 1))
-                l[(u > 0) * (l == u)] -= 1
-                u[(l < (self.args.num_atoms - 1)) * (l == u)] += 1
-                l = torch.max(l, torch.zeros_like(l))
-                u = torch.min(u, torch.full_like(u, self.args.num_atoms - 1))
-                
-                # 分配機率質量
+
+                # Fix edge cases: prevent indices from going out of bounds [0, N_atoms-1]
+                l = torch.max(l, torch.zeros_like(l)) # Ensure l >= 0
+                u = torch.min(u, torch.full_like(u, self.args.num_atoms - 1)) # Ensure u <= N_atoms - 1
+                l[(u > 0) * (l == u)] -= 1 # Handle l==u cases except at boundaries
+                u[(l < (self.args.num_atoms - 1)) * (l == u)] += 1 # Handle l==u cases except at boundaries
+                l = torch.max(l, torch.zeros_like(l)) # Re-ensure l >= 0 after adjustment
+                u = torch.min(u, torch.full_like(u, self.args.num_atoms - 1)) # Re-ensure u <= N_atoms - 1 after adjustment
+
+
                 m = torch.zeros(self.batch_size, self.args.num_atoms, device=self.device)
                 offset = torch.linspace(0, (self.batch_size - 1) * self.args.num_atoms, self.batch_size).long()\
                            .unsqueeze(1).expand(self.batch_size, self.args.num_atoms).to(self.device)
-                
+
+                # Project probability mass
                 m.view(-1).index_add_(0, (l + offset).view(-1), (next_dist * (u.float() - b)).view(-1))
                 m.view(-1).index_add_(0, (u + offset).view(-1), (next_dist * (b - l.float())).view(-1))
-            
-            # 計算交叉熵損失
-            loss = -(m * torch.log(current_dist + 1e-6)).sum(1)
-            td_errors = loss.detach().abs().cpu().numpy()
-            
-        else:
-            # 標準 DQN 損失計算
+
+                target_dist = m # Shape: [B, N_atoms]
+
+            # --- Corrected Log Probability Calculation ---
+            current_dist, current_logits = self.q_net(states) # current_dist shape: [B, A, N_atoms]
+            # actions shape: [B] -> need [B, 1, 1] to gather along dim 1
+            action_idx = actions.view(-1, 1, 1).expand(-1, 1, self.args.num_atoms) # Shape: [B, 1, N_atoms]
+            # Gather the probability distribution for the chosen action
+            chosen_action_dist = current_dist.gather(1, action_idx).squeeze(1) # Shape: [B, N_atoms]
+
+            # Add small epsilon for numerical stability before log
+            log_p = torch.log(chosen_action_dist + 1e-6) # Shape: [B, N_atoms]
+            # --- End Correction ---
+
+            # Calculate cross-entropy loss: L = - sum(target_dist * log_p) over atoms
+            loss = -(target_dist * log_p).sum(1) # Shape: [B]
+            td_errors = loss.detach().abs().cpu().numpy() # Use absolute error for priority
+
+        else: # Standard DQN Loss Calculation
             q_values = self.q_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
-            
             with torch.no_grad():
                 if self.args.use_double_dqn:
-                    next_q_values_online = self.q_net(next_states)
-                    best_actions = next_q_values_online.argmax(1).unsqueeze(1)
-                    next_q_values_target = self.target_net(next_states).gather(1, best_actions).squeeze(1)
+                     next_q_values_online = self.q_net(next_states)
+                     best_actions = next_q_values_online.argmax(1).unsqueeze(1)
+                     next_q_values_target = self.target_net(next_states).gather(1, best_actions).squeeze(1)
                 else:
-                    next_q_values_target = self.target_net(next_states).max(1)[0]
-                
+                     next_q_values_target = self.target_net(next_states).max(1)[0]
+
                 gamma = self.gamma ** self.n_steps if self.use_multistep else self.gamma
                 expected_q_values = rewards + gamma * next_q_values_target * (1 - dones)
-            
+
             loss = F.smooth_l1_loss(q_values, expected_q_values, reduction='none')
-            td_errors = loss.detach().abs().cpu().numpy()
-        
-        # 應用重要性採樣權重
+            td_errors = loss.detach().abs().cpu().numpy() # Use absolute error for priority
+
+
+        # Apply Importance Sampling Weights (if using PER) and calculate mean loss
         if self.args.use_per:
             loss = (loss * weights).mean()
         else:
             loss = loss.mean()
-        
+
         return loss, td_errors
 
 
