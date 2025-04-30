@@ -230,7 +230,7 @@ def evaluate(cli_args): # Renamed internal arg to avoid conflict
 
     # --- Environment Setup ---
     # Use render_mode="rgb_array" for recording frames
-    env = gym.make(cli_args.env)
+    env = gym.make(cli_args.env, render_mode="rgb_array", frameskip=cli_args.frame_skip)
     # Seed the environment for reproducibility in evaluation
     env.action_space.seed(cli_args.seed)
     # Note: env.reset() needs seed argument for newer gym versions >= 0.26
@@ -389,9 +389,10 @@ if __name__ == "__main__":
     parser.add_argument("--model-path", type=str, required=True, help="Path to the trained .pt model state_dict file")
     parser.add_argument("--output-dir", type=str, default="./eval_videos_rainbow", help="Directory to save evaluation videos")
     parser.add_argument("--episodes", type=int, default=5, help="Number of episodes to evaluate")
-    parser.add_argument("--seed", type=int, default=123, help="Random seed for evaluation reproducibility")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for evaluation reproducibility")
     parser.add_argument("--env", type=str, default="ALE/Pong-v5", choices=["ALE/Pong-v5"], help="Gym environment name (currently only Atari supported well by model)") # Limited choices for now
-
+    parser.add_argument("--frame-skip", type=int, default=4, help="Frame skip")
+    
     # --- Hardware Parameters ---
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use for evaluation (cuda or cpu)")
 
