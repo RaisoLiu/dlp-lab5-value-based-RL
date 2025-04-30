@@ -21,6 +21,7 @@ import argparse
 import time
 import math # For Noisy Nets
 from tqdm import tqdm
+import yaml  # 新增 yaml 模組
 
 gym.register_envs(ale_py)
 
@@ -339,6 +340,59 @@ class DQNAgent:
 
         self.support = self.q_net.support
         self.delta_z = (args.v_max - args.v_min) / (args.num_atoms - 1) if args.use_distributional else None
+
+        # 儲存超參數到 YAML 檔案
+        self._save_hyperparameters(args)
+
+    def _save_hyperparameters(self, args):
+        """
+        將超參數儲存到 YAML 檔案中
+        
+        Args:
+            args: 包含所有超參數的命名空間
+        """
+        hyperparams = {
+            'env_name': self.env_name,
+            'device': args.device,
+            'seed': args.seed,
+            'max_steps': args.max_steps,
+            'lr': args.lr,
+            'batch_size': args.batch_size,
+            'memory_size': args.memory_size,
+            'replay_start_size': args.replay_start_size,
+            'discount_factor': args.discount_factor,
+            'target_update_frequency': args.target_update_frequency,
+            'train_frequency': args.train_frequency,
+            'train_per_step': args.train_per_step,
+            'max_episode_steps': args.max_episode_steps,
+            'frame_skip': args.frame_skip,
+            'epsilon_start': args.epsilon_start,
+            'epsilon_min': args.epsilon_min,
+            'epsilon_final_frame': args.epsilon_final_frame,
+            'clip_grad_norm': args.clip_grad_norm,
+            'use_double_dqn': args.use_double_dqn,
+            'use_per': args.use_per,
+            'use_dueling': args.use_dueling,
+            'use_multistep': args.use_multistep,
+            'use_distributional': args.use_distributional,
+            'use_noisy': args.use_noisy,
+            'per_alpha': args.per_alpha,
+            'per_beta_start': args.per_beta_start,
+            'per_beta_frames': args.per_beta_frames,
+            'n_steps': args.n_steps,
+            'num_atoms': args.num_atoms,
+            'v_min': args.v_min,
+            'v_max': args.v_max
+        }
+        
+        # 建立超參數檔案的路徑
+        hyperparams_path = os.path.join(self.save_dir, 'hyperparameters.yaml')
+        
+        # 將超參數寫入 YAML 檔案
+        with open(hyperparams_path, 'w') as f:
+            yaml.dump(hyperparams, f, default_flow_style=False)
+            
+        print(f"超參數已儲存到 {hyperparams_path}")
 
     def select_action(self, state):
         # Noisy Nets handle exploration during training implicitly
@@ -736,6 +790,22 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
+
+    # --- Auto-detect and create save directory ---
+    if args.save_dir == "./results_rainbow":
+        # Find all existing result directories
+        import glob
+        import re
+        existing_dirs = glob.glob("./results_rainbow_*")
+        max_num = 0
+        for dir_path in existing_dirs:
+            match = re.search(r'results_rainbow_(\d+)', dir_path)
+            if match:
+                num = int(match.group(1))
+                max_num = max(max_num, num)
+        # Create new directory with next number
+        args.save_dir = f"./results_rainbow_{max_num + 1}"
+        print(f"自動創建新的結果目錄: {args.save_dir}")
 
     # --- Create Run Name ---
     if args.wandb_run_name is None:
