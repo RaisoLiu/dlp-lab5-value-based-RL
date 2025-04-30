@@ -14,6 +14,7 @@ import os
 from collections import deque
 import argparse
 import math # For Noisy Nets
+import csv
 
 gym.register_envs(ale_py)
 
@@ -230,7 +231,9 @@ def evaluate(cli_args): # Renamed internal arg to avoid conflict
 
     # --- Environment Setup ---
     # Use render_mode="rgb_array" for recording frames
-    env = gym.make(cli_args.env, render_mode="rgb_array", frameskip=cli_args.frame_skip)
+    render_mode = "rgb_array" if not cli_args.no_render else None
+    print(f"Render mode set to: {render_mode}")
+    env = gym.make(cli_args.env, frameskip=cli_args.frame_skip, render_mode=render_mode)
     # Seed the environment for reproducibility in evaluation
     env.action_space.seed(cli_args.seed)
     # Note: env.reset() needs seed argument for newer gym versions >= 0.26
@@ -315,9 +318,10 @@ def evaluate(cli_args): # Renamed internal arg to avoid conflict
         print(f"\nStarting evaluation episode {ep+1}/{cli_args.episodes}...")
 
         while not done and not truncated and step_count < max_eval_steps:
-            # Render frame BEFORE taking a step
-            frame = env.render()
-            frames.append(frame)
+            # Render frame BEFORE taking a step (only if rendering is enabled)
+            if not cli_args.no_render:
+                frame = env.render()
+                frames.append(frame)
 
             # Prepare state tensor
             # Ensure state is float32 numpy array before converting
@@ -355,23 +359,56 @@ def evaluate(cli_args): # Renamed internal arg to avoid conflict
                 print(f"Episode {ep+1} finished after {step_count} steps. Terminated: {terminated}, Truncated: {truncated}")
 
 
-        # --- Save Episode Video ---
-        out_path = os.path.join(cli_args.output_dir, f"eval_ep{ep+1}_{cli_args.env.split('/')[-1]}.mp4")
-        try:
-            # Use imageio to save the recorded frames as MP4
-            with imageio.get_writer(out_path, fps=30) as video:
-                for f in frames:
-                    video.append_data(f)
-            print(f"Saved episode {ep+1} video with total reward {total_reward:.2f} -> {out_path}")
-        except Exception as e:
-            print(f"Error saving video for episode {ep+1}: {e}")
+        # --- Save Episode Video or Log Reward --- 
+        if not cli_args.no_render:
+            out_path = os.path.join(cli_args.output_dir, f"eval_ep{ep+1}_{cli_args.env.split('/')[-1]}.mp4")
+            try:
+                # Use imageio to save the recorded frames as MP4
+                with imageio.get_writer(out_path, fps=30) as video:
+                    for f in frames:
+                        video.append_data(f)
+                print(f"Saved episode {ep+1} video with total reward {total_reward:.2f} -> {out_path}")
+            except Exception as e:
+                print(f"Error saving video for episode {ep+1}: {e}")
+        else:
+            # If not rendering, just print the reward for this episode
+            print(f"Episode {ep+1} finished. Total reward: {total_reward:.2f}")
 
         total_reward_list.append(total_reward)
 
     # --- Cleanup ---
     env.close()
 
-    # --- Print Average Reward ---
+    # --- Save results to CSV if --no-render is used ---
+    if cli_args.no_render and total_reward_list:
+        avg_reward = np.mean(total_reward_list)
+        std_reward = np.std(total_reward_list) # Calculate std dev anyway for summary
+
+        model_dir = os.path.dirname(cli_args.model_path)
+        model_filename = os.path.splitext(os.path.basename(cli_args.model_path))[0]
+        csv_filename = f"{model_filename}_eval_results.csv"
+        csv_path = os.path.join(model_dir, csv_filename)
+
+        try:
+            with open(csv_path, 'w', newline='') as csvfile:
+                fieldnames = ['episode', 'reward']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+                writer.writeheader()
+                for i, reward in enumerate(total_reward_list):
+                    writer.writerow({'episode': i + 1, 'reward': f"{reward:.4f}"}) # Format reward
+
+                # Optionally add average and std dev as separate rows (commented out)
+                # writer.writerow({}) # Blank row
+                # writer.writerow({'episode': 'Average', 'reward': f"{avg_reward:.4f}"})
+                # writer.writerow({'episode': 'Std Dev', 'reward': f"{std_reward:.4f}"}) 
+
+            print(f"\nSaved evaluation rewards to {csv_path}")
+
+        except Exception as e:
+            print(f"Error saving results to CSV at {csv_path}: {e}")
+
+    # --- Print Average Reward Summary (always happens) ---
     if total_reward_list:
         avg_reward = np.mean(total_reward_list)
         std_reward = np.std(total_reward_list)
@@ -406,6 +443,9 @@ if __name__ == "__main__":
     parser.add_argument("--num-atoms", type=int, default=51, help="Number of atoms used in Distributional RL (must match training)")
     parser.add_argument("--v-min", type=float, default=-10.0, help="Minimum value of the support range (must match training)")
     parser.add_argument("--v-max", type=float, default=10.0, help="Maximum value of the support range (must match training)")
+
+    # --- New Parameter for No Render ---
+    parser.add_argument("--no-render", action='store_true', help="Disable rendering and video saving, log rewards to CSV instead")
 
     args = parser.parse_args()
 
